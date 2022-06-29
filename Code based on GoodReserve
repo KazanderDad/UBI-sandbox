@@ -1,0 +1,414 @@
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.7.0 <0.9.0;
+
+import "hardhat/console.sol";
+import "openzeppelin-solidity/contracts/token/ERC20/ERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+
+/**
+ * @title CrossUBItoken
+ * @dev Structural shell for a new ERC20 fungible, upgradeable, mintable token
+ */
+contract CrossUBItoken is ERC20 {
+
+ /* Variables */
+
+    ERC20 public ReserveToken;          // ReserveToken token address (NEAR)
+    address public owner;               // Adress of the DAO wallet
+    uint256 public minimumExitFee;      // Minimum fee to sell, expressed as per mille
+    uint256 public relativeExitFee;     // Exit fee expressed as per percent of nominal price discount
+                                        // ex. relativeExitFee is 110%, nominal discount is 30%, means Esit Fee is 33%
+    uint256 public targetPriceInUSD;
+    uint256 public targetPriceInRT;
+    uint256 public supplyUBItoken;
+    uint256 public supplyReserveToken;
+    uint256 public UBIstreamedPerBlock;
+    uint256 public UBIdemurredPerBlock;
+    uint256 public reserveRatio;
+    bool public reserveRatioOnAuto;
+    mapping (address => uint256) private ubiBalance;
+    AggregatorV3Interface internal priceFeed;   // For accessing the Oracle to get latest price
+
+
+
+ /* Events */
+
+    /**
+    * @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).
+    * Note that `value` may be zero.
+    * Also note that due to continuous minting we cannot emit transfer events from the address 0 when tokens are created.
+    * In order to keep consistency, we decided not to emit those events from the address 0 even when minting is done within a transaction.
+    */
+ //   event Transfer(
+ //       address indexed from, 
+ //       address indexed to, 
+ //       uint256 value);
+
+    /**
+    * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+    * a call to {approve}. `value` is the new allowance.
+    */
+//    event Approval(
+//        address indexed owner, 
+//        address indexed spender, 
+//        uint256 value
+//    );
+
+    // event for EVM logging
+    event OwnerSet(
+        address indexed oldOwner, 
+        address indexed newOwner
+    );
+
+    // Emits when GD tokens are purchased
+    event TokenPurchased(
+        // The initiate of the action
+        address indexed caller,
+        // Reserve tokens amount
+        uint256 reserveAmount,
+        // Minimal UBI return that was
+        // permitted by the caller
+        uint256 minReturn,
+        // Actual return after the
+        // conversion
+        uint256 actualReturn,
+        // Resulting reserve amount
+        uint256 resultingReserveTotal,
+        // Resulting UBI circulation
+        uint256 resultingUBIcirculation
+    );
+
+    // Emits when UBI tokens are sold
+    event TokenSold(
+        // The initiate of the action
+        address indexed caller,
+        // UBI tokens amount
+        uint256 UBIamount,
+        // Minimal reserve tokens return
+        // that was permitted by the caller
+        uint256 minReturn,
+        // The amount of reserve tokens that
+        // was contributed during the
+        // conversion as Exit Fee
+        uint256 exitFeePaid,
+        // Actual return after the
+        // conversion
+        uint256 actualReturn,
+        // Resulting reserve amount
+        uint256 resultingReserveTotal,
+        // Resulting UBI circulation
+        uint256 resultingUBIcirculation
+
+    );
+
+    // modifier to check if caller is owner
+    modifier onlyOwner() {
+        // If the first argument of 'require' evaluates to 'false', execution terminates and all
+        // changes to the state and to Ether balances are reverted.
+        // This used to consume all gas in old EVM versions, but not anymore.
+        // It is often a good idea to use 'require' to check if functions are called correctly.
+        // As a block argument, you can also provide an explanation about what went wrong.
+        require(msg.sender == owner, "Caller is not owner");
+        _;
+    }
+
+
+    /**
+     * @dev Set contract deployer as owner
+     */
+    constructor(ERC20 _ReserveToken) {
+        console.log("Owner contract deployed by:", msg.sender);
+        owner = msg.sender; // 'msg.sender' is sender of current call, contract deployer for a constructor
+        ReserveToken = _ReserveToken;
+
+        /**
+        * Get latest price
+        * Network: Kovan
+        * Aggregator: ETH/USD
+        * Address: 0x9326BFA02ADD2366b30bacB125260Af641031331
+        */
+        priceFeed = AggregatorV3Interface(0x9326BFA02ADD2366b30bacB125260Af641031331);
+
+        emit OwnerSet(address(0), owner);
+    }
+
+ /* Code Inspired by GoodDollar */
+
+    /**
+     * @dev Change owner
+     * @param newOwner address of new owner
+     */
+    function changeOwner(address newOwner) public onlyOwner {
+        emit OwnerSet(owner, newOwner);
+        owner = newOwner;
+    }
+
+    /**
+     * @dev Return owner address 
+     * @return address of owner
+     */
+    function getOwner() external view returns (address) {
+        return owner;
+    }
+
+    /**
+     * @dev Sets minimum exit fee, which is one of two exit fee parameters
+     * @param value & minimumExitFee: minimum exit fee expressed as a percentage
+     */
+    function setMinimumExitFee(uint256 value) public onlyOwner
+    {
+        minimumExitFee = value;
+    }
+
+    /**
+     * @dev Sets minimum exit fee, which is one of two exit fee parameters
+     * @param value & reativeExitFee: relative exit fee expressed as a percentage of diff between target price and net price
+     * example: relativeExitFee is 110%, diff between prices is 40%, then Exit Fee is 40 * 1.1 = 44%
+     */
+    function setRelativeExitFee(uint256 value) public onlyOwner
+    {
+        relativeExitFee = value;
+    }
+
+    /**
+     * @dev Allows the DAO to manually set the target price of the UBI token
+     * @param value & targetPriceInUSD: price of the UBI token expressed in relation to USD
+     * @dev Should ideally instead be received by an Oracle feed from the BigMacIndex database in future releases
+     */
+    function setTargetPriceUSD(uint256 value) public onlyOwner
+    {
+        targetPriceInUSD = value;
+    }
+
+    /**
+     * @dev returns the target price of the UBI token expressed in RT, based on latest RT price
+     * e.g. if a BigMax is 5USD and ReserveToken is 2.5USD, then return value is 2.5RT for one BigMac
+     * @dev There are four different functions that call this funtcion. Try to minimize the number of calls, to reduce gas fees
+     */
+    function getTargetPriceInRT() public view
+        returns (uint256)
+    {
+        (
+            /*uint80 roundID*/,
+            int priceOfRTinUSD,
+            /*uint startedAt*/,
+            /*uint timeStamp*/,
+            /*uint80 answeredInRound*/
+        ) = priceFeed.latestRoundData(uint256);
+        targetPriceInRT = targetPriceInUSD / priceOfRTinUSD;
+        return targetPriceInRT;
+    }
+
+    /**
+     * @dev returns the hypothetical net price as it would be according to the Bancor v1 formula 
+     */
+    function getNetPrice() private view
+        returns (uint256)
+    {
+        return supplyReserveToken / (supplyUBItoken * reserveRatio);
+    }
+
+    /**
+     * @dev Calculates current exit fee for a minimum transaction, 
+        based on two exit fee parameters and two price parameters, 
+        where the minimum fee applies for higher reserve ratios
+        and the relative fee applies for lower reserve ratios
+     */
+    function getCurrentExitFee() external view
+        returns (uint256)
+    {
+        targetPriceInRT = getTargetPriceInRT();
+        return min(1,max(minimumExitFee, relativeExitFee * (targetPriceInRT - getNetPrice()) / targetPriceInRT));
+    }
+
+    /**
+     * @dev calculates the max of two integers
+     */
+    function max(uint256 a, uint256 b) private pure 
+        returns (uint256)
+    {
+        return a >= b ? a : b;
+    }
+
+    /**
+     * @dev determines the min of two integers
+     */
+    function min(uint256 a, uint256 b) private pure 
+        returns (uint256)
+    {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Allows the DAO to set the streaming rate of the UBI token
+     * @param value & UBIstreamedPerBlock: UBI streaming rate expressed as tokens per block
+     */
+    function setUBIstreamedPerBlock(uint256 value) public onlyOwner
+    {
+        UBIstreamedPerBlock = value;
+    }
+
+    /**
+     * @dev Allows the DAO to set the demurrage rate for UBI balances
+     * @param value & UBIdemurredPerBlock: Demurrage rate expressed as PPM per block
+     */
+    function setUBIdemurredPerBlock(uint256 value) public onlyOwner
+    {
+        UBIdemurredPerBlock = value;
+    }
+
+    /**
+     * @dev Allows the DAO to set the reserve ratio parameter
+     * @param value & reserveRatio: Demurrage rate expressed as PPM per block
+     */
+    function setReserveRatio(uint256 value) public onlyOwner
+    {
+        reserveRatio = value;
+        reserveRatioOnAuto = false;
+    }
+
+    /**
+     * @dev returns the reserve ratio parameter
+     */
+    function getReserveRatio() public view
+        returns (uint256)
+    {
+        if (reserveRatioOnAuto = true)
+        {
+            reserveRatio = supplyReserveToken / (supplyUBItoken * getTargetPriceInRT());
+        }
+
+            return reserveRatio;
+    }
+
+    /**
+     * @dev Allows the DAO to set the reserve ratio "auto" to on or off
+     * @param value & reserveRatio: Demurrage rate expressed as PPM per block
+     */
+    function setReserveRatioOnAuto(bool value) public onlyOwner
+    {
+        reserveRatioOnAuto = value;
+    }
+
+    /**
+     * @dev Calculates the expected return of UBI when sending reserve tokens to the contract 
+     *      Based on Bancor v1 formula where Return = supplyUBItoken * ((1 + amountReserveTokens / supplyReserveToken) ^ (getReserveRatio / 1000000) - 1)
+     *      The return can not be greater than the target price * amount of reserve tokens sent
+     *      Note: Does not work in current form, since both the Power (^) operand and the fractional nature of the reserve ratio both are not good Solidity code
+     */
+    function calculatePurchaseReturn(uint256 amountReserveTokens) public view
+        returns (uint256)
+    {
+        uint256 _bancorReturn = supplyUBItoken * ((1 + amountReserveTokens / supplyReserveToken) ^ (getReserveRatio / 1000000) - 1);
+        uint256 _targetPriceReturn = getTargetPriceInRT() * amountReserveTokens;
+        return min(_bancorReturn, _targetPriceReturn);
+    }
+
+
+    /**
+     * @dev Converts ReserveToken tokens to UBI tokens and updates the bonding curve params.
+     * `buyUBItokens` occurs only if the UBI return is above the given minimum. It is possible
+     * to buy only with ReserveToken. MUST call to
+     * `buyWith` `approve` prior this action to allow this contract to accomplish the
+     * conversion.
+     * @param _reserveTokenAmount The amount of `buyWith` tokens that should be converted to GD tokens
+     * @param _minUBIreturn The minimum allowed return in GD tokens
+     * @return (amountUBItoReturn) How much GD tokens were transferred
+     */
+    function buyUBItokens(
+        uint256 _reserveTokenAmount,
+        uint256 _minUBIreturn) public 
+        returns (uint256) 
+    {
+        uint256 amountUBItoReturn = calculatePurchaseReturn(_reserveTokenAmount);
+        require(amountUBItoReturn >= _minUBIreturn, 
+        "UBI return must be above the minReturn"
+        );
+        require(
+            ReserveToken.allowance(msg.sender, address(this)) >= _reserveTokenAmount,
+            "You need to approve ReserveToken transfer first"
+        );
+        require(
+            ReserveToken.transferFrom(msg.sender, address(this), _reserveTokenAmount) == true,
+            "transferFrom failed, make sure you approved ReserveToken transfer"
+        );
+ //*       ERC20.mint(msg.sender, amountUBItoReturn);
+        supplyReserveToken = supplyReserveToken + _reserveTokenAmount;
+        supplyUBItoken = supplyUBItoken + amountUBItoReturn;
+        emit TokenPurchased(
+            msg.sender,
+            _reserveTokenAmount,
+            _minUBIreturn,
+            amountUBItoReturn,
+            supplyReserveToken,
+            supplyUBItoken
+        );
+        return amountUBItoReturn;
+    }
+
+    /**
+     * @dev Calculates the expected return of Reserve Tokens when sending UBI tokens to the contract 
+     *      Reduces the returned amount by an ExitFee which is retained in the Reserve
+     *      Exit fee in good times is based on a MinExitFee as percent of the _UBItokenAmount
+     *      Exit fee in bad times is based on Bancor v1 formula where Return = supplyReserveToken * (1 - (1 - _UBItokenAmount / supplyUBItoken) ^ (1000000 / getReserveRatio))
+     *      The return can not be greater than the _UBItokenAmount / target price
+     *      Note: Does not work in current form, since both the Power (^) operand and the fractional nature of the reserve ratio both are not good Solidity code
+     */
+    function calculateSalesReturn(uint256 _UBItokenAmount) public view
+        returns (uint256, uint256, uint256, uint256)
+    {
+        uint256 _bancorReturn = supplyReserveToken * (1 - (1 - _UBItokenAmount / supplyUBItoken) ^ (1000000 / getReserveRatio));
+        uint256 _targetPriceReturn = _UBItokenAmount / getTargetPriceInRT();
+        uint256 _exitFee = max(_targetPriceReturn * minimumExitFee, (_UBItokenAmount - _bancorReturn) * relativeExitFee);
+        uint256 _exitFeePercent = _exitFee * 100 / _targetPriceReturn;
+        uint256 _expectedReserveReturn = _targetPriceReturn - _exitFee;
+        return (_targetPriceReturn, _expectedReserveReturn, _exitFee, _exitFeePercent);
+    }
+
+    /**
+     * @dev Converts UBI tokens to ReserveToken tokens and updates the bonding curve params.
+     * `sellUBItokens` occurs only if the UBI return is above the given minimum. It is possible
+     * to convert only to ReserveToken. Notice that
+     * there is an ExitFee amount that remains in the reserve.
+     * MUST be called to `approve` UBI token spend prior to this action to allow this
+     * contract to accomplish the conversion.
+     * @param _UBItokenAmount The amount of UBI tokens that should be converted to ReserveToken tokens
+     * @param _minReserveTokenReturn The minimum allowed return in ReserveToken tokens
+     * @return (_reserveReturn) How much ReserveToken tokens were transferred
+     */
+    function sellUBItokens(
+        uint256 _UBItokenAmount,
+        uint256 _minReserveTokenReturn) public 
+        returns (uint256) 
+    {
+        uint256 _targetPriceReturn; 
+        uint256 _reserveReturn;
+        uint256 _exitFee;
+        uint256 _exitFeePercent;
+        
+        (_targetPriceReturn, _reserveReturn, _exitFee, _exitFeePercent) = calculateSalesReturn(_UBItokenAmount);
+        require(_reserveReturn >= _minReserveTokenReturn, 
+            "ReserveToken return must be above the minReturn"
+        );
+        require(
+            ReserveToken.transfer(msg.sender, _reserveReturn) == true, 
+            "Transfer failed"
+        );
+//*        ERC20(ReserveToken).burnFrom(msg.sender, _reserveReturn);
+        supplyReserveToken = supplyReserveToken - _reserveReturn;
+        supplyUBItoken = supplyUBItoken - _UBItokenAmount;
+        emit TokenSold(
+            msg.sender,
+            _UBItokenAmount,
+            _minReserveTokenReturn,
+            _exitFee,
+            _reserveReturn,
+            supplyReserveToken,
+            supplyUBItoken
+        );
+        return _reserveReturn;
+    }
+
+}
